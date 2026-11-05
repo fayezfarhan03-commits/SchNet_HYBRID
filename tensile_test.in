@@ -1,0 +1,103 @@
+# ============================================================
+# Uniaxial tensile test on NiCoCr MEA structure (post-MC relaxed)
+# Goal: stress-strain curve -> elastic modulus (and UTS if run further)
+# ============================================================
+
+units           metal
+dimension       3
+boundary        p p p
+atom_style      atomic
+
+# ---------- Read Monte Carlo output structure ----------
+read_data       final_lammps_baseline_30k.data
+
+# ---------- Interatomic potential ----------
+# Element order taken from header of NiCoCr_lammps__2_.eam: Ni Co Cr
+# !! VERIFY !! Check the Masses section of final_lammps_baseline_30k.data:
+#    Ni ~58.69, Co ~58.93, Cr ~52.00 (g/mol)
+#    If your atom type 1/2/3 masses don't match Ni/Co/Cr in THIS order,
+#    reorder the element list below to match your data file's type order.
+pair_style      eam/alloy
+pair_coeff      * * NiCoCr.lammps.eam Co Cr Ni
+
+neighbor        2.0 bin
+neigh_modify    delay 0 every 1 check yes
+
+# ---------- Record reference (undeformed) box dimensions ----------
+variable        tmp equal "lx"
+variable        Lx0 equal ${tmp}
+variable        tmp equal "ly"
+variable        Ly0 equal ${tmp}
+variable        tmp equal "lz"
+variable        Lz0 equal ${tmp}
+
+# ---------- Energy minimization (relax MC structure) ----------
+reset_timestep  0
+thermo          100
+thermo_style    custom step pe lx ly lz press pxx pyy pzz
+min_style       cg
+minimize        1e-25 1e-25 5000 10000
+
+# ---------- Thermal equilibration at zero pressure (NPT, isotropic) ----------
+variable        T equal 750.0
+timestep        0.001                      # 1 fs
+
+velocity        all create ${T} 12345 mom yes rot yes dist gaussian
+
+fix    eq all npt temp 750 750 .1 iso 0 0 1 drag 1
+thermo          1000
+run             20000                      # 5 ps equilibration
+unfix           eq
+
+reset_timestep  0
+
+# Re-measure box after equilibration -> this is the TRUE strain reference
+variable        tmp equal "lx"
+variable        Lx0 equal ${tmp}
+variable        tmp equal "ly"
+variable        Ly0 equal ${tmp}
+variable        tmp equal "lz"
+variable        Lz0 equal ${tmp}
+
+print           "Reference box after equilibration: Lx0=${Lx0} Ly0=${Ly0} Lz0=${Lz0}"
+
+# ---------- Tensile deformation along z ----------
+# erate is engineering strain rate in 1/ps (metal units time = ps)
+# 1e-3 /ps corresponds to a physical strain rate of ~1e9 /s (typical MD tensile rate)
+variable        erate equal 1.0e-3
+
+# Correct temperature compute while box is being strained (removes affine flow)
+compute         tdef all temp/deform
+
+# Deform box in z at constant erate; x,y free to relax (Poisson contraction)
+fix             def1 all deform 1 z erate ${erate} units box remap x
+fix             npt2 all npt temp ${T} ${T} 0.1 x 0.0 0.0 1.0 y 0.0 0.0 1.0
+fix_modify      npt2 temp tdef
+
+fix             mom all momentum 100 linear 1 1 1
+
+# ---------- Strain and stress (GPa) output ----------
+variable        strain equal "(lz - v_Lz0)/v_Lz0"
+variable        sigzz  equal "-pzz/10000"        # bar -> GPa
+variable        sigxx  equal "-pxx/10000"
+variable        sigyy  equal "-pyy/10000"
+
+fix             out all print 100 "${strain} ${sigzz} ${sigxx} ${sigyy}" &
+                file stress_strain.txt screen no &
+                title "# strain sigma_zz(GPa) sigma_xx(GPa) sigma_yy(GPa)"
+
+thermo          1000
+thermo_style    custom step v_strain temp v_sigzz press
+
+# Optional: uncomment to visualize deformation
+# dump            1 all custom 5000 dump.tensile.lammpstrj id type x y z
+# dump_modify     1 sort id
+
+# ---------- Run deformation to ~15% strain ----------
+# strain = erate * dt * steps -> steps = 0.15 / (1e-3 * 0.001) = 150000
+run             150000
+
+write_data      final_deformed.data
+write_restart   final_deformed.restart
+
+print           "Tensile test complete. Stress-strain data in stress_strain.txt"
